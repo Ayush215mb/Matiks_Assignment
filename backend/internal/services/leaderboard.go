@@ -1,4 +1,3 @@
-// internal/services/leaderboard.go
 package services
 
 import (
@@ -135,7 +134,7 @@ func (s *LeaderboardService) UpdateScore(ctx context.Context, username string, n
 
 // SearchUser searches for users by username prefix
 func (s *LeaderboardService) SearchUser(ctx context.Context, query string) ([]models.UserRankResponse, error) {
-	users := s.store.SearchUsers(query, 50)
+	users := s.store.SearchUsers(query, 10000)
 
 	results := make([]models.UserRankResponse, 0, len(users))
 	for _, user := range users {

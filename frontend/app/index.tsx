@@ -1,5 +1,5 @@
 import { StatusBar } from "expo-status-bar";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   ActivityIndicator,
   FlatList,
@@ -11,70 +11,96 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
-import { getLeaderboard, searchUser, seedData, type Player, type PlayerWithRank } from "./services/api";
+import {
+  getLeaderboard,
+  searchUser,
+  seedData,
+  type PlayerWithRank,
+} from "./services/api";
 
 export default function Index() {
-  const [leaderboard, setLeaderboard] = useState<Player[]>([]);
+  const [leaderboard, setLeaderboard] = useState<PlayerWithRank[]>([]);
   const [searchText, setSearchText] = useState("");
-  const [searchResults, setSearchResults] = useState<PlayerWithRank[] | null>(null);
+  const [searchResults, setSearchResults] = useState<PlayerWithRank[] | null>(
+    null,
+  );
   const [refreshing, setRefreshing] = useState(false);
   const [loading, setLoading] = useState(true);
   const [searchLoading, setSearchLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [page, setPage] = useState(1);
+  const [hasMore, setHasMore] = useState(false);
+  const [totalUsers, setTotalUsers] = useState(0);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const limit = 50;
 
+  const fetchLeaderboard = useCallback(
+    async (pageNum: number = 1, append: boolean = false) => {
+      try {
+        setError(null);
+        setLoadingMore(append);
 
-  const fetchLeaderboard = useCallback(async () => {
-    try {
-      setError(null);
-      const data = await getLeaderboard();
-      setLeaderboard(data);
-    } catch (err: any) {
-      console.error("Failed to fetch leaderboard:", err);
-      const isNetworkError = err?.message?.includes("Network Error") || err?.code === "ERR_NETWORK";
-      if (isNetworkError) {
-        setError("Cannot connect to server. Make sure the backend is running on port 8080.");
-      } else {
-        setError("Failed to load leaderboard. Please try again.");
+        const response = await getLeaderboard(pageNum, limit);
+
+        if (append) {
+          setLeaderboard((prev) => [...prev, ...response.entries]);
+        } else {
+          setLeaderboard(response.entries);
+        }
+
+        setPage(response.page);
+        setHasMore(response.has_more);
+        setTotalUsers(response.total_users);
+      } catch (err: any) {
+        console.error("Failed to fetch leaderboard:", err);
+        const isNetworkError =
+          err?.message?.includes("Network Error") ||
+          err?.code === "ERR_NETWORK";
+        if (isNetworkError) {
+          setError(
+            "Cannot connect to server. Make sure the backend is running on port 8080.",
+          );
+        } else {
+          setError("Failed to load leaderboard. Please try again.");
+        }
+      } finally {
+        setLoading(false);
+        setRefreshing(false);
+        setLoadingMore(false);
       }
-    } finally {
-      setLoading(false);
-      setRefreshing(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    seedData(10000); //seed the data
-    handleRefresh();
-    fetchLeaderboard(); //fetch the leaderboard
-    
-  }, [fetchLeaderboard]);
-
-  const sortedLeaderboard = useMemo(
-    () => [...leaderboard].sort((a, b) => b.rating - a.rating),
-    [leaderboard],
+    },
+    [limit],
   );
 
-  const leaderboardWithRank = useMemo(() => {
-    const ranked: PlayerWithRank[] = [] as PlayerWithRank[];
-    let currentRank = 0;
-    let lastRating: number | null = null;
-
-    sortedLeaderboard.forEach((player) => {
-      if (player.rating !== lastRating) {
-        currentRank = currentRank + 1;
-        lastRating = player.rating;
+  useEffect(() => {
+    const initializeData = async () => {
+      try {
+        setLoading(true);
+        // Seed data first, then fetch leaderboard
+        await seedData(10000);
+        await fetchLeaderboard(1, false);
+      } catch (err) {
+        console.error("Failed to initialize:", err);
+        setError("Failed to initialize. Please try again.");
+        setLoading(false);
       }
+    };
 
-      ranked.push({ ...player, rank: currentRank } as PlayerWithRank);
-    });
-
-    return ranked;
-  }, [sortedLeaderboard]);
+    initializeData();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const handleRefresh = useCallback(() => {
     setRefreshing(true);
-    fetchLeaderboard();
+    setPage(1);
+    fetchLeaderboard(1, false);
   }, [fetchLeaderboard]);
+
+  const handleLoadMore = useCallback(() => {
+    if (hasMore && !loadingMore && !refreshing) {
+      fetchLeaderboard(page + 1, true);
+    }
+  }, [hasMore, loadingMore, refreshing, page, fetchLeaderboard]);
 
   const handleSearch = useCallback(async () => {
     const query = searchText.trim();
@@ -90,10 +116,13 @@ export default function Index() {
       setError(null);
     } catch (err: any) {
       console.error("Failed to search user:", err);
-      const isNetworkError = err?.message?.includes("Network Error") || err?.code === "ERR_NETWORK";
+      const isNetworkError =
+        err?.message?.includes("Network Error") || err?.code === "ERR_NETWORK";
       setSearchResults([]);
       if (isNetworkError) {
-        setError("Cannot connect to server. Make sure the backend is running on port 8080.");
+        setError(
+          "Cannot connect to server. Make sure the backend is running on port 8080.",
+        );
       } else {
         setError("Failed to search. Please try again.");
       }
@@ -115,6 +144,15 @@ export default function Index() {
       </Text>
     </View>
   );
+
+  const renderFooter = () => {
+    if (!loadingMore) return null;
+    return (
+      <View className="py-4">
+        <ActivityIndicator size="small" color="#34d399" />
+      </View>
+    );
+  };
 
   const renderSearchResult = () => {
     if (!searchText.trim()) {
@@ -159,7 +197,9 @@ export default function Index() {
                 <Text className="text-xs uppercase tracking-wide text-emerald-200">
                   Rank
                 </Text>
-                <Text className="text-lg font-bold text-white">#{item.rank}</Text>
+                <Text className="text-lg font-bold text-white">
+                  #{item.rank}
+                </Text>
               </View>
               <View className="flex-1 pl-3">
                 <Text className="text-sm font-semibold text-white">
@@ -186,7 +226,9 @@ export default function Index() {
         <StatusBar style="light" />
         <View className="flex-1 items-center justify-center">
           <ActivityIndicator size="large" color="#34d399" />
-          <Text className="mt-4 text-base text-slate-300">Loading leaderboard...</Text>
+          <Text className="mt-4 text-base text-slate-300">
+            Loading leaderboard...
+          </Text>
         </View>
       </SafeAreaView>
     );
@@ -212,7 +254,9 @@ export default function Index() {
         )}
 
         <View className="gap-3 rounded-2xl border border-white/10 bg-white/5 p-4">
-          <Text className="text-lg font-semibold text-white">Search player</Text>
+          <Text className="text-lg font-semibold text-white">
+            Search player
+          </Text>
           <View className="flex-row items-center gap-3">
             <TextInput
               placeholder="Search by username"
@@ -241,13 +285,15 @@ export default function Index() {
 
         <View className="mt-6 flex-1">
           <View className="mb-3 flex-row items-center justify-between">
-            <Text className="text-lg font-semibold text-white">Top players</Text>
+            <Text className="text-lg font-semibold text-white">
+              Top players
+            </Text>
             <Text className="text-sm text-slate-400">
-              Showing {leaderboardWithRank.length} players
+              Showing {leaderboard.length} of {totalUsers} players
             </Text>
           </View>
 
-          {leaderboardWithRank.length === 0 ? (
+          {leaderboard.length === 0 ? (
             <View className="flex-1 items-center justify-center py-12">
               <Text className="text-base text-slate-400">
                 No players found. Pull down to refresh.
@@ -255,7 +301,7 @@ export default function Index() {
             </View>
           ) : (
             <FlatList
-              data={leaderboardWithRank}
+              data={leaderboard}
               keyExtractor={(item) => item.username}
               renderItem={renderRow}
               contentContainerStyle={{ gap: 8, paddingBottom: 24 }}
@@ -267,6 +313,9 @@ export default function Index() {
                   tintColor="#34d399"
                 />
               }
+              onEndReached={handleLoadMore}
+              onEndReachedThreshold={0.5}
+              ListFooterComponent={renderFooter}
               initialNumToRender={20}
               removeClippedSubviews
             />

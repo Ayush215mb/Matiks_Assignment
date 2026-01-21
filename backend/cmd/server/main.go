@@ -1,4 +1,3 @@
-// cmd/server/main.go
 package main
 
 import (
@@ -94,7 +93,7 @@ func main() {
 
 	go func() {
 		log.Printf("🚀 Server starting on port %s", port)
-		log.Printf("📊 Using in-memory storage (no Redis required)")
+
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Failed to start server: %v", err)
 		}
