@@ -1,6 +1,7 @@
 import { StatusBar } from "expo-status-bar";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
+  ActivityIndicator,
   FlatList,
   Pressable,
   RefreshControl,
@@ -10,95 +11,96 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
-type Player = {
-  id: string;
-  username: string;
-  rating: number;
-};
-
-type PlayerWithRank = Player & { rank: number };
-
-const LEADERBOARD_SIZE = 1000;
-const MIN_RATING = 100;
-const MAX_RATING = 5000;
-
-const createInitialData = (): Player[] =>
-  Array.from({ length: LEADERBOARD_SIZE }, (_, index) => ({
-    id: String(index + 1),
-    username: `player_${String(index + 1).padStart(3, "0")}`,
-    rating: MIN_RATING + Math.floor(Math.random() * (MAX_RATING - MIN_RATING)),
-  }));
-
-const getUpdatedRatings = (players: Player[]): Player[] =>
-  players.map((player) => {
-    const swing = Math.floor(Math.random() * 120) - 60; // -60 to +60
-    const next = player.rating + swing;
-    const clamped = Math.min(MAX_RATING, Math.max(MIN_RATING, next));
-    return { ...player, rating: clamped };
-  });
+import { getLeaderboard, searchUser, seedData, type Player, type PlayerWithRank } from "./services/api";
 
 export default function Index() {
-  const [leaderboard, setLeaderboard] = useState<Player[]>(createInitialData);
+  const [leaderboard, setLeaderboard] = useState<Player[]>([]);
   const [searchText, setSearchText] = useState("");
-  const [searchResults, setSearchResults] = useState<PlayerWithRank[] | null>(
-    null,
-  );
+  const [searchResults, setSearchResults] = useState<PlayerWithRank[] | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [searchLoading, setSearchLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  // Keep the board fresh to mimic live rating changes.
-  useEffect(() => {
-    const intervalId = setInterval(() => {
-      setLeaderboard((prev) => getUpdatedRatings(prev));
-    }, 4000);
 
-    return () => clearInterval(intervalId);
+  const fetchLeaderboard = useCallback(async () => {
+    try {
+      setError(null);
+      const data = await getLeaderboard();
+      setLeaderboard(data);
+    } catch (err: any) {
+      console.error("Failed to fetch leaderboard:", err);
+      const isNetworkError = err?.message?.includes("Network Error") || err?.code === "ERR_NETWORK";
+      if (isNetworkError) {
+        setError("Cannot connect to server. Make sure the backend is running on port 8080.");
+      } else {
+        setError("Failed to load leaderboard. Please try again.");
+      }
+    } finally {
+      setLoading(false);
+      setRefreshing(false);
+    }
   }, []);
+
+  useEffect(() => {
+    seedData(10000); //seed the data
+    handleRefresh();
+    fetchLeaderboard(); //fetch the leaderboard
+    
+  }, [fetchLeaderboard]);
 
   const sortedLeaderboard = useMemo(
     () => [...leaderboard].sort((a, b) => b.rating - a.rating),
     [leaderboard],
   );
 
-  const leaderboardWithRank = useMemo(
-    () => {
-      // Dense ranking: same rating -> same rank; next distinct rating increments by 1.
-      const ranked: PlayerWithRank[] = [];
-      let currentRank = 0;
-      let lastRating: number | null = null;
+  const leaderboardWithRank = useMemo(() => {
+    const ranked: PlayerWithRank[] = [] as PlayerWithRank[];
+    let currentRank = 0;
+    let lastRating: number | null = null;
 
-      sortedLeaderboard.forEach((player, index) => {
-        if (player.rating !== lastRating) {
-          currentRank = currentRank + 1;
-          lastRating = player.rating;
-        }
+    sortedLeaderboard.forEach((player) => {
+      if (player.rating !== lastRating) {
+        currentRank = currentRank + 1;
+        lastRating = player.rating;
+      }
 
-        ranked.push({ ...player, rank: currentRank });
-      });
+      ranked.push({ ...player, rank: currentRank } as PlayerWithRank);
+    });
 
-      return ranked;
-    },
-    [sortedLeaderboard],
-  );
+    return ranked;
+  }, [sortedLeaderboard]);
 
-  const handleRefresh = () => {
+  const handleRefresh = useCallback(() => {
     setRefreshing(true);
-    setLeaderboard((prev) => getUpdatedRatings(prev));
-    setRefreshing(false);
-  };
+    fetchLeaderboard();
+  }, [fetchLeaderboard]);
 
-  const handleSearch = () => {
-    const query = searchText.trim().toLowerCase();
+  const handleSearch = useCallback(async () => {
+    const query = searchText.trim();
     if (!query) {
       setSearchResults(null);
       return;
     }
 
-    const matches = leaderboardWithRank.filter((player) =>
-      player.username.toLowerCase().includes(query),
-    );
-
-    setSearchResults(matches);
-  };
+    setSearchLoading(true);
+    try {
+      const results = await searchUser(query);
+      setSearchResults(results);
+      setError(null);
+    } catch (err: any) {
+      console.error("Failed to search user:", err);
+      const isNetworkError = err?.message?.includes("Network Error") || err?.code === "ERR_NETWORK";
+      setSearchResults([]);
+      if (isNetworkError) {
+        setError("Cannot connect to server. Make sure the backend is running on port 8080.");
+      } else {
+        setError("Failed to search. Please try again.");
+      }
+    } finally {
+      setSearchLoading(false);
+    }
+  }, [searchText]);
 
   const renderRow = ({ item }: { item: PlayerWithRank }) => (
     <View className="flex-row items-center justify-between rounded-2xl border border-white/10 bg-white/5 px-4 py-3">
@@ -118,15 +120,24 @@ export default function Index() {
     if (!searchText.trim()) {
       return (
         <Text className="text-sm text-slate-300">
-          Type a username (e.g. player_042) to see their live rank.
+          Type a username to search for their live global rank.
         </Text>
+      );
+    }
+
+    if (searchLoading) {
+      return (
+        <View className="flex-row items-center justify-center py-4">
+          <ActivityIndicator size="small" color="#34d399" />
+          <Text className="ml-2 text-sm text-slate-300">Searching...</Text>
+        </View>
       );
     }
 
     if (!searchResults || searchResults.length === 0) {
       return (
         <Text className="text-sm font-semibold text-rose-300">
-          No live rank found for {searchText.trim()}.
+          No users found for &quot;{searchText.trim()}&quot;.
         </Text>
       );
     }
@@ -137,22 +148,18 @@ export default function Index() {
           <Text className="text-sm font-semibold uppercase tracking-wide text-emerald-200">
             Results · {searchResults.length}
           </Text>
-          <Text className="text-xs text-slate-400">
-            Live ranks update every few seconds
-          </Text>
+          <Text className="text-xs text-slate-400">Live global ranks</Text>
         </View>
         <FlatList
           data={searchResults}
-          keyExtractor={(item) => item.id}
+          keyExtractor={(item) => item.username}
           renderItem={({ item }) => (
             <View className="flex-row items-center justify-between rounded-2xl border border-emerald-400/40 bg-emerald-500/10 px-4 py-3">
               <View className="w-16">
                 <Text className="text-xs uppercase tracking-wide text-emerald-200">
                   Rank
                 </Text>
-                <Text className="text-lg font-bold text-white">
-                  #{item.rank}
-                </Text>
+                <Text className="text-lg font-bold text-white">#{item.rank}</Text>
               </View>
               <View className="flex-1 pl-3">
                 <Text className="text-sm font-semibold text-white">
@@ -173,6 +180,18 @@ export default function Index() {
     );
   };
 
+  if (loading) {
+    return (
+      <SafeAreaView className="flex-1 bg-slate-950">
+        <StatusBar style="light" />
+        <View className="flex-1 items-center justify-center">
+          <ActivityIndicator size="large" color="#34d399" />
+          <Text className="mt-4 text-base text-slate-300">Loading leaderboard...</Text>
+        </View>
+      </SafeAreaView>
+    );
+  }
+
   return (
     <SafeAreaView className="flex-1 bg-slate-950">
       <StatusBar style="light" />
@@ -182,9 +201,15 @@ export default function Index() {
             Live Leaderboard
           </Text>
           <Text className="text-base text-slate-300">
-            Updated every few seconds to mimic thousands of active players.
+            Real-time rankings updated from the server.
           </Text>
         </View>
+
+        {error && (
+          <View className="mb-4 rounded-xl border border-rose-500/50 bg-rose-500/10 px-4 py-3">
+            <Text className="text-sm font-semibold text-rose-300">{error}</Text>
+          </View>
+        )}
 
         <View className="gap-3 rounded-2xl border border-white/10 bg-white/5 p-4">
           <Text className="text-lg font-semibold text-white">Search player</Text>
@@ -202,7 +227,8 @@ export default function Index() {
             />
             <Pressable
               onPress={handleSearch}
-              className="rounded-xl bg-emerald-500 px-4 py-3"
+              disabled={searchLoading}
+              className="rounded-xl bg-emerald-500 px-4 py-3 disabled:opacity-50"
               accessibilityRole="button"
             >
               <Text className="text-base font-semibold text-slate-950">
@@ -221,22 +247,30 @@ export default function Index() {
             </Text>
           </View>
 
-          <FlatList
-            data={leaderboardWithRank}
-            keyExtractor={(item) => item.id}
-            renderItem={renderRow}
-            contentContainerStyle={{ gap: 8, paddingBottom: 24 }}
-            keyboardShouldPersistTaps="handled"
-            refreshControl={
-              <RefreshControl
-                refreshing={refreshing}
-                onRefresh={handleRefresh}
-                tintColor="#34d399"
-              />
-            }
-            initialNumToRender={20}
-            removeClippedSubviews
-          />
+          {leaderboardWithRank.length === 0 ? (
+            <View className="flex-1 items-center justify-center py-12">
+              <Text className="text-base text-slate-400">
+                No players found. Pull down to refresh.
+              </Text>
+            </View>
+          ) : (
+            <FlatList
+              data={leaderboardWithRank}
+              keyExtractor={(item) => item.username}
+              renderItem={renderRow}
+              contentContainerStyle={{ gap: 8, paddingBottom: 24 }}
+              keyboardShouldPersistTaps="handled"
+              refreshControl={
+                <RefreshControl
+                  refreshing={refreshing}
+                  onRefresh={handleRefresh}
+                  tintColor="#34d399"
+                />
+              }
+              initialNumToRender={20}
+              removeClippedSubviews
+            />
+          )}
         </View>
       </View>
     </SafeAreaView>
