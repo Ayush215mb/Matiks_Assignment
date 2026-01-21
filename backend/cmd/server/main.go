@@ -1,3 +1,4 @@
+// cmd/server/main.go
 package main
 
 import (
@@ -11,7 +12,7 @@ import (
 
 	"backend/internal/handlers"
 	"backend/internal/services"
-	"backend/pkg/redis"
+	"backend/pkg/store"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
@@ -24,18 +25,12 @@ func main() {
 		log.Println("No .env file found, using system environment variables")
 	}
 
-	// Initialize Redis
-	redisClient := redis.NewClient()
-	ctx := context.Background()
-
-	// Test Redis connection
-	if err := redisClient.Ping(ctx).Err(); err != nil {
-		log.Fatalf("Failed to connect to Redis: %v", err)
-	}
-	log.Println("✓ Connected to Redis")
+	// Initialize in-memory store
+	memoryStore := store.NewMemoryStore()
+	log.Println("✓ Initialized in-memory store")
 
 	// Initialize services
-	leaderboardService := services.NewLeaderboardService(redisClient)
+	leaderboardService := services.NewLeaderboardService(memoryStore)
 
 	// Initialize handlers
 	leaderboardHandler := handlers.NewLeaderboardHandler(leaderboardService)
@@ -55,7 +50,10 @@ func main() {
 
 	// Health check
 	router.GET("/health", func(c *gin.Context) {
-		c.JSON(200, gin.H{"status": "ok"})
+		c.JSON(200, gin.H{
+			"status": "ok",
+			"store":  "in-memory",
+		})
 	})
 
 	// API routes
@@ -79,6 +77,7 @@ func main() {
 	}
 
 	// Start random score update simulation
+	ctx := context.Background()
 	go leaderboardService.StartRandomUpdates(ctx)
 
 	// Server configuration
@@ -95,6 +94,7 @@ func main() {
 
 	go func() {
 		log.Printf("🚀 Server starting on port %s", port)
+		log.Printf("📊 Using in-memory storage (no Redis required)")
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Failed to start server: %v", err)
 		}
@@ -107,10 +107,10 @@ func main() {
 
 	log.Println("Shutting down server...")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if err := srv.Shutdown(ctx); err != nil {
+	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Fatal("Server forced to shutdown:", err)
 	}
 

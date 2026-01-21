@@ -1,3 +1,4 @@
+// internal/services/leaderboard.go
 package services
 
 import (
@@ -5,53 +6,35 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
-	"strings"
 	"time"
 
 	"backend/internal/models"
-	redisClient "backend/pkg/redis"
-
-	"github.com/redis/go-redis/v9"
+	"backend/pkg/store"
 )
 
 type LeaderboardService struct {
-	redis *redis.Client
+	store *store.MemoryStore
 }
 
-func NewLeaderboardService(redis *redis.Client) *LeaderboardService {
-	return &LeaderboardService{redis: redis}
+func NewLeaderboardService(store *store.MemoryStore) *LeaderboardService {
+	return &LeaderboardService{store: store}
 }
 
 // SeedData seeds the leaderboard with random users
 func (s *LeaderboardService) SeedData(ctx context.Context, count int) error {
 	log.Printf("Seeding %d users...", count)
 
-	// Use pipeline for batch operations
-	pipe := s.redis.Pipeline()
-
 	for i := 0; i < count; i++ {
 		username := fmt.Sprintf("user_%d", i+1)
 		rating := rand.Intn(4901) + 100 // Random rating between 100 and 5000
 
-		// Add to sorted set (leaderboard)
-		pipe.ZAdd(ctx, redisClient.LeaderboardKey, redis.Z{
-			Score:  float64(rating),
-			Member: username,
-		})
+		if err := s.store.AddUser(username, rating); err != nil {
+			return fmt.Errorf("failed to add user: %w", err)
+		}
 
-		// Execute in batches of 1000 for better performance
 		if (i+1)%1000 == 0 {
-			if _, err := pipe.Exec(ctx); err != nil {
-				return fmt.Errorf("failed to seed batch: %w", err)
-			}
-			pipe = s.redis.Pipeline()
 			log.Printf("Seeded %d users...", i+1)
 		}
-	}
-
-	// Execute remaining operations
-	if _, err := pipe.Exec(ctx); err != nil {
-		return fmt.Errorf("failed to seed final batch: %w", err)
 	}
 
 	log.Printf("✓ Successfully seeded %d users", count)
@@ -60,154 +43,108 @@ func (s *LeaderboardService) SeedData(ctx context.Context, count int) error {
 
 // GetLeaderboard retrieves paginated leaderboard with correct ranks
 func (s *LeaderboardService) GetLeaderboard(ctx context.Context, page, limit int) (*models.LeaderboardResponse, error) {
-	// Calculate offset
-	offset := (page - 1) * limit
+	// Get all users sorted
+	allUsers := s.store.GetAllUsers()
+	total := len(allUsers)
 
-	// Get total count
-	total, err := s.redis.ZCard(ctx, redisClient.LeaderboardKey).Result()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get total count: %w", err)
+	// Calculate pagination
+	offset := (page - 1) * limit
+	if offset >= total {
+		return &models.LeaderboardResponse{
+			Entries:    []models.LeaderboardEntry{},
+			Page:       page,
+			Limit:      limit,
+			TotalUsers: int64(total),
+			HasMore:    false,
+		}, nil
 	}
 
-	// Get users with scores in descending order
-	users, err := s.redis.ZRevRangeWithScores(ctx, redisClient.LeaderboardKey, int64(offset), int64(offset+limit-1)).Result()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get leaderboard: %w", err)
+	end := offset + limit
+	if end > total {
+		end = total
 	}
 
 	// Calculate ranks considering ties
-	entries := make([]models.LeaderboardEntry, 0, len(users))
+	entries := make([]models.LeaderboardEntry, 0, end-offset)
+	currentRank := 1
 
-	for i, user := range users {
-		var rank int
-
-		if i == 0 {
-			// For first user, calculate rank based on users with higher scores
-			count, err := s.redis.ZCount(ctx, redisClient.LeaderboardKey,
-				fmt.Sprintf("(%f", user.Score), "+inf").Result()
-			if err != nil {
-				return nil, err
-			}
-			rank = int(count) + 1
-		} else {
-			// If same score as previous, same rank
-			if users[i].Score == users[i-1].Score {
-				rank = entries[i-1].Rank
-			} else {
-				// Calculate rank for new score
-				count, err := s.redis.ZCount(ctx, redisClient.LeaderboardKey,
-					fmt.Sprintf("(%f", user.Score), "+inf").Result()
-				if err != nil {
-					return nil, err
-				}
-				rank = int(count) + 1
-			}
+	for i := 0; i < end; i++ {
+		// Update rank when score changes
+		if i > 0 && allUsers[i].Rating != allUsers[i-1].Rating {
+			currentRank = i + 1
 		}
 
-		entries = append(entries, models.LeaderboardEntry{
-			Rank:     rank,
-			Username: user.Member.(string),
-			Rating:   int(user.Score),
-		})
+		// Only add entries within the requested page
+		if i >= offset {
+			entries = append(entries, models.LeaderboardEntry{
+				Rank:     currentRank,
+				Username: allUsers[i].Username,
+				Rating:   allUsers[i].Rating,
+			})
+		}
 	}
 
-	hasMore := int64(offset+limit) < total
+	hasMore := end < total
 
 	return &models.LeaderboardResponse{
 		Entries:    entries,
 		Page:       page,
 		Limit:      limit,
-		TotalUsers: total,
+		TotalUsers: int64(total),
 		HasMore:    hasMore,
 	}, nil
 }
 
 // GetUserRank retrieves a specific user's rank
 func (s *LeaderboardService) GetUserRank(ctx context.Context, username string) (*models.UserRankResponse, error) {
-	// Get user's score
-	score, err := s.redis.ZScore(ctx, redisClient.LeaderboardKey, username).Result()
-	if err == redis.Nil {
-		return nil, fmt.Errorf("user not found")
-	}
+	user, err := s.store.GetUser(username)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get user score: %w", err)
+		return nil, err
 	}
 
-	// Count users with strictly higher scores
-	count, err := s.redis.ZCount(ctx, redisClient.LeaderboardKey,
-		fmt.Sprintf("(%f", score), "+inf").Result()
+	rank, err := s.store.GetUserRank(username)
 	if err != nil {
-		return nil, fmt.Errorf("failed to calculate rank: %w", err)
+		return nil, err
 	}
-
-	rank := count + 1
 
 	return &models.UserRankResponse{
 		Username: username,
-		Rating:   int(score),
-		Rank:     rank,
+		Rating:   user.Rating,
+		Rank:     int64(rank),
 	}, nil
 }
 
 // UpdateScore updates a user's score
 func (s *LeaderboardService) UpdateScore(ctx context.Context, username string, newRating int) error {
 	// Check if user exists
-	exists, err := s.redis.ZScore(ctx, redisClient.LeaderboardKey, username).Result()
-	if err == redis.Nil {
-		return fmt.Errorf("user not found")
+	user, err := s.store.GetUser(username)
+	if err != nil {
+		return err
 	}
-	if err != nil && err != redis.Nil {
-		return fmt.Errorf("failed to check user: %w", err)
-	}
+
+	oldRating := user.Rating
 
 	// Update score
-	_, err = s.redis.ZAdd(ctx, redisClient.LeaderboardKey, redis.Z{
-		Score:  float64(newRating),
-		Member: username,
-	}).Result()
-
-	if err != nil {
+	if err := s.store.AddUser(username, newRating); err != nil {
 		return fmt.Errorf("failed to update score: %w", err)
 	}
 
-	log.Printf("Updated %s: %.0f -> %d", username, exists, newRating)
+	log.Printf("Updated %s: %d -> %d", username, oldRating, newRating)
 	return nil
 }
 
 // SearchUser searches for users by username prefix
 func (s *LeaderboardService) SearchUser(ctx context.Context, query string) ([]models.UserRankResponse, error) {
-	query = strings.ToLower(query)
+	users := s.store.SearchUsers(query, 50)
 
-	// Get all users (for now, in production you'd use a separate index)
-	users, err := s.redis.ZRevRangeWithScores(ctx, redisClient.LeaderboardKey, 0, -1).Result()
-	if err != nil {
-		return nil, fmt.Errorf("failed to search users: %w", err)
-	}
-
-	results := make([]models.UserRankResponse, 0)
-	currentRank := 1
-
-	for i, user := range users {
-		username := user.Member.(string)
-
-		// Calculate rank
-		if i > 0 && users[i].Score != users[i-1].Score {
-			currentRank = i + 1
-		}
-
-		// Check if username matches query
-		if strings.Contains(strings.ToLower(username), query) {
-			results = append(results, models.UserRankResponse{
-				Username: username,
-				Rating:   int(user.Score),
-				Rank:     int64(currentRank),
-			})
-
-			// Limit results
-			if len(results) >= 50 {
-				break
-			}
-		}
+	results := make([]models.UserRankResponse, 0, len(users))
+	for _, user := range users {
+		rank, _ := s.store.GetUserRank(user.Username)
+		results = append(results, models.UserRankResponse{
+			Username: user.Username,
+			Rating:   user.Rating,
+			Rank:     int64(rank),
+		})
 	}
 
 	return results, nil
@@ -215,41 +152,13 @@ func (s *LeaderboardService) SearchUser(ctx context.Context, query string) ([]mo
 
 // GetStats returns leaderboard statistics
 func (s *LeaderboardService) GetStats(ctx context.Context) (*models.StatsResponse, error) {
-	// Total users
-	total, err := s.redis.ZCard(ctx, redisClient.LeaderboardKey).Result()
-	if err != nil {
-		return nil, err
-	}
-
-	// Min rating (lowest score)
-	minUsers, err := s.redis.ZRangeWithScores(ctx, redisClient.LeaderboardKey, 0, 0).Result()
-	if err != nil || len(minUsers) == 0 {
-		return nil, err
-	}
-
-	// Max rating (highest score)
-	maxUsers, err := s.redis.ZRevRangeWithScores(ctx, redisClient.LeaderboardKey, 0, 0).Result()
-	if err != nil || len(maxUsers) == 0 {
-		return nil, err
-	}
-
-	// Calculate average (sum all scores / count)
-	allUsers, err := s.redis.ZRangeWithScores(ctx, redisClient.LeaderboardKey, 0, -1).Result()
-	if err != nil {
-		return nil, err
-	}
-
-	var sum float64
-	for _, user := range allUsers {
-		sum += user.Score
-	}
-	avg := sum / float64(total)
+	total, minRating, maxRating, avgRating := s.store.GetStats()
 
 	return &models.StatsResponse{
-		TotalUsers:    total,
-		MinRating:     minUsers[0].Score,
-		MaxRating:     maxUsers[0].Score,
-		AverageRating: avg,
+		TotalUsers:    int64(total),
+		MinRating:     float64(minRating),
+		MaxRating:     float64(maxRating),
+		AverageRating: avgRating,
 	}, nil
 }
 
@@ -265,19 +174,19 @@ func (s *LeaderboardService) StartRandomUpdates(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			count := s.store.GetUserCount()
+			if count == 0 {
+				continue
+			}
+
 			// Get random user
-			count, err := s.redis.ZCard(ctx, redisClient.LeaderboardKey).Result()
-			if err != nil || count == 0 {
+			randomIndex := rand.Intn(count)
+			allUsers := s.store.GetAllUsers()
+			if randomIndex >= len(allUsers) {
 				continue
 			}
 
-			randomIndex := rand.Int63n(count)
-			users, err := s.redis.ZRangeWithScores(ctx, redisClient.LeaderboardKey, randomIndex, randomIndex).Result()
-			if err != nil || len(users) == 0 {
-				continue
-			}
-
-			username := users[0].Member.(string)
+			username := allUsers[randomIndex].Username
 			newRating := rand.Intn(4901) + 100
 
 			if err := s.UpdateScore(ctx, username, newRating); err != nil {
